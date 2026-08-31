@@ -260,6 +260,19 @@ HRESULT APIENTRY virtio_wddm_blt(DXGI_DDI_ARG_BLT *pArgs) {
 
 HRESULT APIENTRY virtio_wddm_resolve_shared_resource(DXGI_DDI_ARG_RESOLVESHAREDRESOURCE *pArgs) {
     TRACE();
+
+    VIRTIO_WDDM_Device *device = (void *) pArgs->hDevice;
+
+    /*
+     * ResolveSharedResource marks an ownership transition for a shared
+     * resource. Flush any partially built DXVK/D3D11 command stream so
+     * modifications made by this device are submitted before ownership is
+     * handed off. Synchronization of the submitted GPU work is handled by
+     * the runtime/kernel; a CPU wait here would unnecessarily serialize the
+     * shared-resource path.
+     */
+    ID3D11DeviceContext1_Flush(device->base.pCtx1);
+
     return S_OK;
 }
 
