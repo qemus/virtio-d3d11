@@ -1,0 +1,24 @@
+TRITON_PATH := thirdparty/triton/src/virtio/neptune/triton
+
+TRITON_INCLUDES := $(TRITON_PATH)
+TRITON_DEFINES := TRITON_BUILD_COMMON_TRANSLATION_LAYER
+
+CFLAGS+=$(addprefix -I,$(TRITON_INCLUDES)) $(addprefix -D,$(TRITON_DEFINES))
+
+TRITON_SRC := \
+    tritonDDI.c \
+    tritonDxbc.c \
+    tritonQuery.c \
+    tritonResource.c \
+    tritonShader.c \
+    tritonState.c \
+    tritonView.c \
+
+TRITON_OBJS := $(addprefix build/triton/,$(addsuffix .o,$(basename $(TRITON_SRC))))
+
+build/triton.a: $(TRITON_OBJS)
+	$(AR) rcs $@ $^
+
+build/triton/%.o: $(TRITON_PATH)/%.c | build
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c -o $@ $<
