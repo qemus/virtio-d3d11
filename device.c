@@ -150,6 +150,102 @@ static const char *dxgi_ddi_interface_version_name(unsigned interface_, unsigned
     }
 }
 
+static void destroy_device_objects(VIRTIO_WDDM_Device *device) {
+    if (device->base.pCtx1 != NULL) {
+        ID3D11DeviceContext1_Flush(device->base.pCtx1);
+    }
+
+    if (device->present.context != NULL && device->base.KTCallbacks.pfnDestroyContextCb != NULL) {
+        D3DDDICB_DESTROYCONTEXT context = {
+            .hContext = device->present.context,
+        };
+        HRESULT hr = device->base.KTCallbacks.pfnDestroyContextCb(device->base.hRTDevice.handle, &context);
+        if (FAILED(hr)) {
+            ERROR("%s: Failed to destroy present context: 0x%08lx", __FUNCTION__, hr);
+        }
+        device->present.context = NULL;
+    }
+
+    if (device->paging.queue != 0 && device->base.KTCallbacks.pfnDestroyPagingQueueCb != NULL) {
+        D3DDDI_DESTROYPAGINGQUEUE paging_queue = {
+            .hPagingQueue = device->paging.queue,
+        };
+        HRESULT hr = device->base.KTCallbacks.pfnDestroyPagingQueueCb(device->base.hRTDevice.handle, &paging_queue);
+        if (FAILED(hr)) {
+            ERROR("%s: Failed to destroy paging queue: 0x%08lx", __FUNCTION__, hr);
+        }
+        device->paging.queue = 0;
+        device->paging.sync_object = 0;
+        device->paging.fence_value = NULL;
+    }
+
+    if (device->present.fence_handle != NULL) {
+        if (!CloseHandle(device->present.fence_handle)) {
+            ERROR("%s: Failed to close present fence handle: %lu", __FUNCTION__, GetLastError());
+        }
+        device->present.fence_handle = NULL;
+        device->present.fence = 0;
+    }
+
+    if (device->base.pPresentFence != NULL) {
+        ID3D11Fence_Release(device->base.pPresentFence);
+        device->base.pPresentFence = NULL;
+    }
+
+    if (device->base.pCtx1 != NULL) {
+        ID3D11DeviceContext1_Release(device->base.pCtx1);
+        device->base.pCtx1 = NULL;
+    }
+    if (device->base.pCtx2 != NULL) {
+        ID3D11DeviceContext2_Release(device->base.pCtx2);
+        device->base.pCtx2 = NULL;
+    }
+    if (device->base.pCtx3 != NULL) {
+        ID3D11DeviceContext3_Release(device->base.pCtx3);
+        device->base.pCtx3 = NULL;
+    }
+    if (device->base.pCtx4 != NULL) {
+        ID3D11DeviceContext4_Release(device->base.pCtx4);
+        device->base.pCtx4 = NULL;
+    }
+
+    if (device->base.pDev1 != NULL) {
+        ID3D11Device1_Release(device->base.pDev1);
+        device->base.pDev1 = NULL;
+    }
+    if (device->base.pDev2 != NULL) {
+        ID3D11Device2_Release(device->base.pDev2);
+        device->base.pDev2 = NULL;
+    }
+    if (device->base.pDev3 != NULL) {
+        ID3D11Device3_Release(device->base.pDev3);
+        device->base.pDev3 = NULL;
+    }
+    if (device->base.pDev5 != NULL) {
+        ID3D11Device5_Release(device->base.pDev5);
+        device->base.pDev5 = NULL;
+    }
+
+    if (device->adapter != NULL) {
+        IDXGIAdapter_Release(device->adapter);
+        device->adapter = NULL;
+    }
+
+    if (device->vk_inst != VK_NULL_HANDLE && device->vk_DestroyInstance != NULL) {
+        device->vk_DestroyInstance(device->vk_inst, NULL);
+        device->vk_inst = VK_NULL_HANDLE;
+    }
+
+    if (device->vulkan != NULL) {
+        FreeLibrary(device->vulkan);
+        device->vulkan = NULL;
+    }
+    if (device->icd != NULL) {
+        FreeLibrary(device->icd);
+        device->icd = NULL;
+    }
+}
+
 static void APIENTRY virtio_wddm_destroy_device(D3D10DDI_HDEVICE hDevice)
 {
     TRACE();
@@ -159,27 +255,7 @@ static void APIENTRY virtio_wddm_destroy_device(D3D10DDI_HDEVICE hDevice)
 
     // FIXME: ensure that DXVK never tries to submit any more commands
 
-    ID3D11Fence_Release(device->base.pPresentFence);
-
-    ID3D11DeviceContext1_Flush(device->base.pCtx1);
-
-    ID3D11DeviceContext1_Release(device->base.pCtx1);
-    ID3D11DeviceContext2_Release(device->base.pCtx2);
-    ID3D11DeviceContext3_Release(device->base.pCtx3);
-    ID3D11DeviceContext4_Release(device->base.pCtx4);
-
-    ID3D11Device1_Release(device->base.pDev1);
-    ID3D11Device2_Release(device->base.pDev2);
-    ID3D11Device3_Release(device->base.pDev3);
-    ID3D11Device5_Release(device->base.pDev5);
-
-    IDXGIAdapter_Release(device->adapter);
-
-    device->vk_DestroyInstance(device->vk_inst, NULL);
-
-    FreeLibrary(device->vulkan);
-    FreeLibrary(device->icd);
-
+    destroy_device_objects(device);
     memset(device, 0, sizeof(*device));
 }
 
@@ -235,7 +311,7 @@ static const char *get_drm_context_type_name(uint32_t drm_context_type) {
         case VIRTGPU_DRM_CONTEXT_XE:       return "xe";
     }
     ERROR("%s: Unknown drm context type: %u", __FUNCTION__, drm_context_type);
-    return NULL;
+    return "unknown";
 }
 
 static const wchar_t *get_drm_context_type_icd_name(uint32_t drm_context_type) {
@@ -294,7 +370,11 @@ static HMODULE load_icd(const wchar_t *icd_name) {
 
     if (!umd_module) return NULL;
 
-    GetModuleFileNameW(umd_module, umd_path, MAX_PATH);
+    DWORD path_len = GetModuleFileNameW(umd_module, umd_path, MAX_PATH);
+    if (path_len == 0 || path_len >= MAX_PATH) {
+        return NULL;
+    }
+
     wchar_t *last_slash = wcsrchr(umd_path, L'\\');
     if (!last_slash) {
         return NULL;
@@ -313,6 +393,11 @@ HRESULT APIENTRY virtio_wddm_create_device(D3D10DDI_HADAPTER hAdapter, D3D10DDIA
     TRACE();
     HRESULT hr = S_OK;
     VkResult res = VK_SUCCESS;
+    CLEANUP_FREE VkExtensionProperties *extension_props = NULL;
+    CLEANUP_FREE const char **extension_names = NULL;
+    CLEANUP_D3D11_DEVICE ID3D11Device *d3d11_device = NULL;
+    CLEANUP_D3D11_CONTEXT ID3D11DeviceContext *d3d11_context = NULL;
+    IDXGIFactory4 *factory = NULL;
 
     VIRTIO_WDDM_Adapter *adapter = hAdapter.pDrvPrivate;
     VIRTIO_WDDM_Device *device = pArgs->hDrvDevice.pDrvPrivate;
@@ -330,6 +415,11 @@ HRESULT APIENTRY virtio_wddm_create_device(D3D10DDI_HADAPTER hAdapter, D3D10DDIA
     device->dxgi_callbacks = pArgs->DXGIBaseDDI.pDXGIBaseCallbacks;
 
     device->vulkan = LoadLibraryA("vulkan-1.dll");
+    if (device->vulkan == NULL) {
+        ERROR("%s: Failed to load Vulkan loader: %lu", __FUNCTION__, GetLastError());
+        hr = E_FAIL;
+        goto fail;
+    }
 
     if (adapter->supported_capsets & VIRTIO_WDDM_CAPSET_MASK_DRM) {
         uint32_t drm_context_type = 0;
@@ -348,7 +438,11 @@ HRESULT APIENTRY virtio_wddm_create_device(D3D10DDI_HADAPTER hAdapter, D3D10DDIA
         device->icd = load_icd(L"vulkan_virtio.dll");
     }
 
-    ASSERT(device->icd != NULL);
+    if (device->icd == NULL) {
+        ERROR("%s: Failed to load Vulkan ICD", __FUNCTION__);
+        hr = E_FAIL;
+        goto fail;
+    }
 
     device->callbacks = (VkD3DDDICallbacks) {
         .sType = VK_STRUCTURE_TYPE_D3DDDI_CALLBACKS,
@@ -368,7 +462,11 @@ HRESULT APIENTRY virtio_wddm_create_device(D3D10DDI_HADAPTER hAdapter, D3D10DDIA
         .flags = 0,
         .pfnGetInstanceProcAddr = (PFN_vkGetInstanceProcAddrLUNARG) GetProcAddress(device->icd, "vk_icdGetInstanceProcAddr"),
     };
-    ASSERT(driver_info.pfnGetInstanceProcAddr != NULL);
+    if (driver_info.pfnGetInstanceProcAddr == NULL) {
+        ERROR("%s: Failed to load vk_icdGetInstanceProcAddr from ICD", __FUNCTION__);
+        hr = E_FAIL;
+        goto fail;
+    }
 
     VkDirectDriverLoadingListLUNARG loading_list = {
         .sType = VK_STRUCTURE_TYPE_DIRECT_DRIVER_LOADING_LIST_LUNARG,
@@ -382,25 +480,42 @@ HRESULT APIENTRY virtio_wddm_create_device(D3D10DDI_HADAPTER hAdapter, D3D10DDIA
 
     PFN_vkGetInstanceProcAddr vk_GetInstanceProcAddr = (PFN_vkGetInstanceProcAddr) GetProcAddress(device->vulkan, "vkGetInstanceProcAddr");
     PFN_vkGetDeviceProcAddr vk_GetDeviceProcAddr = (PFN_vkGetDeviceProcAddr) GetProcAddress(device->vulkan, "vkGetDeviceProcAddr");
+    if (vk_GetInstanceProcAddr == NULL || vk_GetDeviceProcAddr == NULL) {
+        ERROR("%s: Failed to load Vulkan loader entry points", __FUNCTION__);
+        hr = E_FAIL;
+        goto fail;
+    }
 
 #define LOAD_PROC(name) PFN_vk##name vk_##name = (PFN_vk##name) vk_GetInstanceProcAddr(NULL, "vk" #name)
     LOAD_PROC(CreateInstance);
     LOAD_PROC(EnumerateInstanceExtensionProperties);
 #undef LOAD_PROC
+    if (vk_CreateInstance == NULL || vk_EnumerateInstanceExtensionProperties == NULL) {
+        ERROR("%s: Failed to load required Vulkan global entry points", __FUNCTION__);
+        hr = E_FAIL;
+        goto fail;
+    }
 
     uint32_t extension_count = 0;
     res = vk_EnumerateInstanceExtensionProperties(NULL, &extension_count, NULL);
     if (res != VK_SUCCESS) {
         ERROR("Failed to enumerate instance extensions: %s", vk_result_to_str(res));
-        return E_FAIL;
+        hr = E_FAIL;
+        goto fail;
     }
 
-    CLEANUP_FREE VkExtensionProperties *extension_props = calloc(sizeof(*extension_props), extension_count);
-    CLEANUP_FREE const char **extension_names = calloc(sizeof(*extension_names), extension_count);
+    extension_props = calloc(sizeof(*extension_props), extension_count);
+    extension_names = calloc(sizeof(*extension_names), extension_count);
+    if (extension_count != 0 && (extension_props == NULL || extension_names == NULL)) {
+        ERROR("%s: Failed to allocate Vulkan extension list", __FUNCTION__);
+        hr = E_OUTOFMEMORY;
+        goto fail;
+    }
     res = vk_EnumerateInstanceExtensionProperties(NULL, &extension_count, extension_props);
     if (res != VK_SUCCESS) {
         ERROR("Failed to enumerate instance extensions: %s", vk_result_to_str(res));
-        return E_FAIL;
+        hr = E_FAIL;
+        goto fail;
     }
 
     bool have_LUNARG_direct_driver_loading = false;
@@ -414,7 +529,8 @@ HRESULT APIENTRY virtio_wddm_create_device(D3D10DDI_HADAPTER hAdapter, D3D10DDIA
 
     if (!have_LUNARG_direct_driver_loading) {
         ERROR("Direct driver loading is not supported, cannot continue");
-        return E_FAIL;
+        hr = E_FAIL;
+        goto fail;
     }
 
     VkApplicationInfo app_info = {
@@ -439,33 +555,43 @@ HRESULT APIENTRY virtio_wddm_create_device(D3D10DDI_HADAPTER hAdapter, D3D10DDIA
         .ppEnabledExtensionNames = (const char *[]) { VK_LUNARG_DIRECT_DRIVER_LOADING_EXTENSION_NAME },
     };
 
-    VkInstance instance;
-    res = vk_CreateInstance(&info, NULL, &instance);
+    res = vk_CreateInstance(&info, NULL, &device->vk_inst);
     if (res != VK_SUCCESS) {
         ERROR("Failed to create instance: %s", vk_result_to_str(res));
-        DebugBreak();
-        return E_FAIL;
+        hr = E_FAIL;
+        goto fail;
+    }
+
+    device->vk_DestroyInstance = (PFN_vkDestroyInstance) vk_GetInstanceProcAddr(device->vk_inst, "vkDestroyInstance");
+    if (device->vk_DestroyInstance == NULL) {
+        device->vk_DestroyInstance = (PFN_vkDestroyInstance) GetProcAddress(device->vulkan, "vkDestroyInstance");
+    }
+    if (device->vk_DestroyInstance == NULL) {
+        ERROR("%s: Failed to load vkDestroyInstance", __FUNCTION__);
+        hr = E_FAIL;
+        goto fail;
     }
 
     Vulkan_Instance_Info instance_info = {
         .loader_proc = vk_GetInstanceProcAddr,
-        .instance = instance,
+        .instance = device->vk_inst,
         // TODO: do we need other extensions?
         .extension_count = 1,
         .extension_names = (const char *[]) { VK_LUNARG_DIRECT_DRIVER_LOADING_EXTENSION_NAME },
     };
 
-    IDXGIFactory4 *factory = NULL;
     hr = DXVK_CreateDXGIFactory(&instance_info, &IID_IDXGIFactory4, (void **) &factory);
     if (FAILED(hr)) {
         ERROR("Failed to create DXVK DXGI factory: 0x%x", hr);
-        return hr;
+        goto fail;
     }
 
     hr = IDXGIFactory4_EnumAdapterByLuid(factory, adapter->luid, &IID_IDXGIAdapter, (void **) &device->adapter);
+    IDXGIFactory4_Release(factory);
+    factory = NULL;
     if (FAILED(hr)) {
         ERROR("Failed to enum DXVK DXGI adapter by LUID %lx-%lx: 0x%x", adapter->luid.HighPart, adapter->luid.LowPart, hr);
-        return hr;
+        goto fail;
     }
 
     D3D_FEATURE_LEVEL feature_level;
@@ -484,71 +610,70 @@ HRESULT APIENTRY virtio_wddm_create_device(D3D10DDI_HADAPTER hAdapter, D3D10DDIA
             break;
         default:
             ERROR("%s: unknown pipeline level %u", __FUNCTION__, D3D11DDI_EXTRACT_3DPIPELINELEVEL_FROM_FLAGS(pArgs->Flags));
-            return E_FAIL;
+            hr = E_FAIL;
+            goto fail;
     }
 
-    CLEANUP_D3D11_DEVICE ID3D11Device *d3d11_device = NULL;
-    CLEANUP_D3D11_CONTEXT ID3D11DeviceContext *d3d11_context = NULL;
     hr = D3D11CreateDevice(device->adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0,
                            &feature_level, 1, D3D11_SDK_VERSION, &d3d11_device,
                            &device->base.FeatureLevel, &d3d11_context);
     if (FAILED(hr)) {
         ERROR("Failed to create DXVK D3D11 device: 0x%x", hr);
-        return hr;
+        goto fail;
     }
 
     hr = ID3D11Device_QueryInterface(d3d11_device, &IID_ID3D11Device1, (void **) &device->base.pDev1);
     if (FAILED(hr)) {
         ERROR("Failed to query ID3D11Device1 interface for DXVK D3D11 device: 0x%x", hr);
-        return hr;
+        goto fail;
     }
 
     hr = ID3D11Device_QueryInterface(d3d11_device, &IID_ID3D11Device2, (void **) &device->base.pDev2);
     if (FAILED(hr)) {
         ERROR("Failed to query ID3D11Device2 interface for DXVK D3D11 device: 0x%x", hr);
-        return hr;
+        goto fail;
     }
 
     hr = ID3D11Device_QueryInterface(d3d11_device, &IID_ID3D11Device3, (void **) &device->base.pDev3);
     if (FAILED(hr)) {
         ERROR("Failed to query ID3D11Device3 interface for DXVK D3D11 device: 0x%x", hr);
-        return hr;
+        goto fail;
     }
 
     hr = ID3D11Device_QueryInterface(d3d11_device, &IID_ID3D11Device5, (void **) &device->base.pDev5);
     if (FAILED(hr)) {
         ERROR("Failed to query ID3D11Device5 interface for DXVK D3D11 device: 0x%x", hr);
-        return hr;
+        goto fail;
     }
 
     hr = ID3D11DeviceContext_QueryInterface(d3d11_context, &IID_ID3D11DeviceContext1, (void **) &device->base.pCtx1);
     if (FAILED(hr)) {
         ERROR("Failed to query ID3D11DeviceContext1 interface for DXVK D3D11 device context: 0x%x", hr);
-        return hr;
+        goto fail;
     }
 
     hr = ID3D11DeviceContext_QueryInterface(d3d11_context, &IID_ID3D11DeviceContext2, (void **) &device->base.pCtx2);
     if (FAILED(hr)) {
         ERROR("Failed to query ID3D11DeviceContext2 interface for DXVK D3D11 device context: 0x%x", hr);
-        return hr;
+        goto fail;
     }
 
     hr = ID3D11DeviceContext_QueryInterface(d3d11_context, &IID_ID3D11DeviceContext3, (void **) &device->base.pCtx3);
     if (FAILED(hr)) {
         ERROR("Failed to query ID3D11DeviceContext3 interface for DXVK D3D11 device context: 0x%x", hr);
-        return hr;
+        goto fail;
     }
 
     hr = ID3D11DeviceContext_QueryInterface(d3d11_context, &IID_ID3D11DeviceContext4, (void **) &device->base.pCtx4);
     if (FAILED(hr)) {
         ERROR("Failed to query ID3D11DeviceContext4 interface for DXVK D3D11 device context: 0x%x", hr);
-        return hr;
+        goto fail;
     }
 
     hr = DXVK_IDXGIVkInteropDevice1_GetVulkanHandles(device->base.pDev1, &device->vk_inst, &device->vk_phys, &device->vk);
     if (FAILED(hr)) {
         ERROR("Failed to GetVulkanHandles from DXVK D3D11 device: 0x%x", hr);
-        return hr;
+        goto fail;
     }
 
     INFO("%s: inst %p, phys %p, dev %p", __FUNCTION__, device->vk_inst, device->vk_phys, device->vk);
@@ -559,7 +684,7 @@ HRESULT APIENTRY virtio_wddm_create_device(D3D10DDI_HADAPTER hAdapter, D3D10DDIA
 #define X(name) device->vk_##name = (PFN_vk##name) vk_GetDeviceProcAddr(device->vk, "vk" #name);
     VK_DEVICE_FUNCTION_LIST
 #undef X
-#define X(name) if (device->vk_##name == NULL) { ERROR("Failed to load vk%s from ICD", #name); return E_FAIL; }
+#define X(name) if (device->vk_##name == NULL) { ERROR("Failed to load vk%s from ICD", #name); hr = E_FAIL; goto fail; }
     VK_INSTANCE_FUNCTION_LIST
     VK_DEVICE_FUNCTION_LIST
 #undef X
@@ -567,7 +692,7 @@ HRESULT APIENTRY virtio_wddm_create_device(D3D10DDI_HADAPTER hAdapter, D3D10DDIA
     hr = ID3D11Device5_CreateFence(device->base.pDev5, 0, D3D11_FENCE_FLAG_SHARED, &IID_ID3D11Fence, (void **) &device->base.pPresentFence);
     if (FAILED(hr)) {
         ERROR("Failed to create D3D11 fence: 0x%x", hr);
-        return hr;
+        goto fail;
     }
     device->base.presentFenceValue = 1;
 
@@ -582,23 +707,25 @@ HRESULT APIENTRY virtio_wddm_create_device(D3D10DDI_HADAPTER hAdapter, D3D10DDIA
     };
     res = device->vk_GetSemaphoreWin32HandleKHR(device->vk, &get_handle_info, &present_fence);
     if (res != VK_SUCCESS) {
-        ERROR("Failed to create instance: %s", vk_result_to_str(res));
-        return E_FAIL;
+        ERROR("Failed to export present fence: %s", vk_result_to_str(res));
+        hr = E_FAIL;
+        goto fail;
     }
 
+    device->present.fence_handle = present_fence;
     device->present.fence = (D3DKMT_HANDLE) (intptr_t) present_fence;
     //INFO("%s: Present monitored fence = %x", __FUNCTION__, device->present.fence);
 
     hr = create_present_context(device);
     if (FAILED(hr)) {
         ERROR("Failed to create present context: 0x%x", hr);
-        return hr;
+        goto fail;
     }
 
     hr = create_paging_queue(device);
     if (FAILED(hr)) {
         ERROR("Failed to create paging queue: 0x%x", hr);
-        return hr;
+        goto fail;
     }
 
     INFO("%s: D3D11 DDI version = %s", __FUNCTION__, d3d10_ddi_interface_version_name(pArgs->Interface));
@@ -627,7 +754,8 @@ HRESULT APIENTRY virtio_wddm_create_device(D3D10DDI_HADAPTER hAdapter, D3D10DDIA
             break;
         default:
             ERROR("%s: unsupported interface: %u", __FUNCTION__, pArgs->Interface);
-            return E_FAIL;
+            hr = E_FAIL;
+            goto fail;
     }
 
     pArgs->p11DeviceFuncs->pfnCalcPrivateResourceSize = virtio_wddm_calc_resource_size;
@@ -661,4 +789,21 @@ HRESULT APIENTRY virtio_wddm_create_device(D3D10DDI_HADAPTER hAdapter, D3D10DDIA
 
     return S_OK;
     //return DXGI_STATUS_NO_REDIRECTION;
+
+fail:
+    if (factory != NULL) {
+        IDXGIFactory4_Release(factory);
+        factory = NULL;
+    }
+    if (d3d11_context != NULL) {
+        ID3D11DeviceContext_Release(d3d11_context);
+        d3d11_context = NULL;
+    }
+    if (d3d11_device != NULL) {
+        ID3D11Device_Release(d3d11_device);
+        d3d11_device = NULL;
+    }
+    destroy_device_objects(device);
+    memset(device, 0, sizeof(*device));
+    return FAILED(hr) ? hr : E_FAIL;
 }

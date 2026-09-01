@@ -218,7 +218,7 @@ static ssize_t vulkan_find_mem_type(VIRTIO_WDDM_Device *device, VkMemoryProperty
     };
     device->vk_GetPhysicalDeviceMemoryProperties2(device->vk_phys, &props);
     for (unsigned i = 0u; i < props.memoryProperties.memoryTypeCount; ++i) {
-        if (req_bits & (1 << i)) {
+        if (req_bits & (1u << i)) {
             if ((props.memoryProperties.memoryTypes[i].propertyFlags & flags) == flags) {
                 return i;
             }
@@ -592,7 +592,7 @@ static HRESULT create_shared_3d_resource(VIRTIO_WDDM_Device *device, D3D11_TEXTU
             .last_level = desc->MipLevels - 1,
             .nr_samples = desc->SampleDesc.Count,
             .flags = 0,
-            .size = desc->Width * desc->Height * dxgi_format_bytes_per_pixel(desc->Format),
+            .size = (uint64_t) desc->Width * desc->Height * dxgi_format_bytes_per_pixel(desc->Format),
         },
     };
 
@@ -1025,6 +1025,7 @@ void APIENTRY virtio_wddm_create_resource(D3D10DDI_HDEVICE hDevice, const D3D11D
 
     if (FAILED(hr)) {
         ERROR("%s: failed dim=%d hr=0x%08lx", __FUNCTION__, pArgs->ResourceDimension, hr);
+        free(subresource_data);
         tritonSetError(&device->base, hr);
         return;
     }
@@ -1308,13 +1309,20 @@ void virtio_wddm_save_texture_to_ppm(VIRTIO_WDDM_Device *device, VIRTIO_WDDM_Res
     hr = ID3D11DeviceContext1_Map(device->base.pCtx1, (ID3D11Resource *) staging, 0, D3D11_MAP_READ, 0, &mapped);
     if (FAILED(hr)){
         ERROR("%s: Failed to map staging texture: 0x%08lx", __FUNCTION__, hr);
+        ID3D11Texture2D_Release(staging);
         return;
     }
 
     {
         FILE *ppm = fopen(filename, "wb");
+        if (ppm == NULL) {
+            ERROR("%s: Failed to open %s for writing", __FUNCTION__, filename);
+            ID3D11DeviceContext1_Unmap(device->base.pCtx1, (ID3D11Resource *) staging, 0);
+            ID3D11Texture2D_Release(staging);
+            return;
+        }
         fprintf(ppm, "P6\n");
-        fprintf(ppm, "%u %u\n", mapped.RowPitch / 4, desc.Height);
+        fprintf(ppm, "%u %u\n", desc.Width, desc.Height);
         fprintf(ppm, "255\n");
         for (size_t y = 0; y < desc.Height; y++) {
             for (size_t x = 0; x < desc.Width; x++) {

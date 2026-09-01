@@ -40,6 +40,7 @@ typedef struct {
         HANDLE context;
         VkSemaphore semaphore;
         D3DKMT_HANDLE fence;
+        HANDLE fence_handle;
     } present;
 
     VkInstance vk_inst;
