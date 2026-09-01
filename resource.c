@@ -288,11 +288,11 @@ static HRESULT create_shared_vk_image(VIRTIO_WDDM_Device *device, D3D11_TEXTURE2
        .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
     };
     device->vk_GetImageMemoryRequirements2(device->vk, &mem_req_info, &mem_req);
-    ssize_t mem = vulkan_find_mem_type(device, 0, mem_req.memoryRequirements.memoryTypeBits);
     if (mem < 0) {
         ERROR("%s: Failed to find Vulkan memory type", __FUNCTION__);
         device->vk_DestroyImage(device->vk, *image, NULL);
         *image = VK_NULL_HANDLE;
+        *memory = VK_NULL_HANDLE;
         return E_OUTOFMEMORY;
     }
 
