@@ -41,7 +41,11 @@ virtio_wddm_present() {
 static HRESULT virtio_wddm_sync_with_present_context(VIRTIO_WDDM_Device *device) {
     uint64_t value = atomic_fetch_add_explicit((volatile uint64_t *) &device->base.presentFenceValue, 1, memory_order_acq_rel);
 
-    ID3D11DeviceContext4_Signal(device->base.pCtx4, device->base.pPresentFence, value);
+    HRESULT hr = ID3D11DeviceContext4_Signal(device->base.pCtx4, device->base.pPresentFence, value);
+    if (FAILED(hr)) {
+        ERROR("%s: Failed to signal present fence: 0x%08lx", __FUNCTION__, hr);
+        return hr;
+    }
     ID3D11DeviceContext1_Flush(device->base.pCtx1);
 
 #if 0
@@ -58,7 +62,7 @@ static HRESULT virtio_wddm_sync_with_present_context(VIRTIO_WDDM_Device *device)
         .ObjectHandleArray = &device->present.fence,
         .MonitoredFenceValueArray = &value,
     };
-    HRESULT hr = device->base.KTCallbacks.pfnWaitForSynchronizationObjectFromGpuCb(device->base.hRTDevice.handle, &wait);
+    hr = device->base.KTCallbacks.pfnWaitForSynchronizationObjectFromGpuCb(device->base.hRTDevice.handle, &wait);
     if (FAILED(hr)) {
         ERROR("%s: Failed to wait from gpu: 0x%08lx", __FUNCTION__, hr);
         return hr;
@@ -71,12 +75,15 @@ HRESULT APIENTRY virtio_wddm_present(DXGI_DDI_ARG_PRESENT *pArgs) {
     TRACE();
     VIRTIO_WDDM_Device *device = (void *) pArgs->hDevice;
     VIRTIO_WDDM_Resource *src = (void *) pArgs->hSurfaceToPresent;
+    VIRTIO_WDDM_Resource *dst = pArgs->hDstResource ? (void *) pArgs->hDstResource : NULL;
     HRESULT hr = S_OK;
 
     // Looks like Blt could be zero for primaries
     //ASSERT(pArgs->Flags.Blt);
-    ASSERT(pArgs->hDstResource == 0);
     ASSERT(src->base.hKMAllocation != 0);
+    if (dst != NULL) {
+        ASSERT(dst->base.hKMAllocation != 0);
+    }
 
     if (false) {
         char name[256];
@@ -92,7 +99,7 @@ HRESULT APIENTRY virtio_wddm_present(DXGI_DDI_ARG_PRESENT *pArgs) {
 
     DXGIDDICB_PRESENT present = {
         .hSrcAllocation = src->base.hKMAllocation,
-        .hDstAllocation = 0,
+        .hDstAllocation = dst != NULL ? dst->base.hKMAllocation : 0,
         .pDXGIContext = pArgs->pDXGIContext,
         .hContext = device->present.context,
     };
@@ -142,13 +149,31 @@ HRESULT APIENTRY virtio_wddm_set_display_mode(DXGI_DDI_ARG_SETDISPLAYMODE *pArgs
 
 HRESULT APIENTRY virtio_wddm_set_resource_priority(DXGI_DDI_ARG_SETRESOURCEPRIORITY *pArgs) {
     TRACE();
-    return S_OK;
+    VIRTIO_WDDM_Device *device = (void *) pArgs->hDevice;
+    VIRTIO_WDDM_Resource *resource = (void *) pArgs->hResource;
+
+    if (resource->base.hKMAllocation == 0) {
+        return S_OK;
+    }
+
+    D3DDDICB_SETPRIORITY priority = {
+        .hResource = NULL,
+        .NumAllocations = 1,
+        .HandleList = &resource->base.hKMAllocation,
+        .pPriorities = &pArgs->Priority,
+    };
+    HRESULT hr = device->base.KTCallbacks.pfnSetPriorityCb(device->base.hRTDevice.handle, &priority);
+    if (FAILED(hr)) {
+        ERROR("%s: failed to set resource priority: 0x%08lx", __FUNCTION__, hr);
+    }
+    return hr;
 }
 
 HRESULT APIENTRY virtio_wddm_query_resource_residency(DXGI_DDI_ARG_QUERYRESOURCERESIDENCY *pArgs) {
     TRACE();
-    HRESULT hr = S_OK;
     VIRTIO_WDDM_Device *device = (void *) pArgs->hDevice;
+    bool resident_in_shared_memory = false;
+    bool not_resident = false;
 
     for (size_t i = 0; i < pArgs->Resources; i++) {
         VIRTIO_WDDM_Resource *resource = (void *) pArgs->pResources[i];
@@ -178,16 +203,22 @@ HRESULT APIENTRY virtio_wddm_query_resource_residency(DXGI_DDI_ARG_QUERYRESOURCE
                 break;
             case D3DDDI_RESIDENCYSTATUS_RESIDENTINSHAREDMEMORY:
                 pArgs->pStatus[i] = DXGI_DDI_RESIDENCY_RESIDENT_IN_SHARED_MEMORY;
-                hr = S_RESIDENT_IN_SHARED_MEMORY;
+                resident_in_shared_memory = true;
                 break;
             case D3DDDI_RESIDENCYSTATUS_NOTRESIDENT:
                 pArgs->pStatus[i] = DXGI_DDI_RESIDENCY_EVICTED_TO_DISK;
-                hr = S_NOT_RESIDENT;
+                not_resident = true;
                 break;
         }
     }
 
-    return hr;
+    if (not_resident) {
+        return S_NOT_RESIDENT;
+    }
+    if (resident_in_shared_memory) {
+        return S_RESIDENT_IN_SHARED_MEMORY;
+    }
+    return S_OK;
 }
 
 HRESULT APIENTRY virtio_wddm_rotate_resource_identities(DXGI_DDI_ARG_ROTATE_RESOURCE_IDENTITIES *pArgs) {
@@ -260,6 +291,19 @@ HRESULT APIENTRY virtio_wddm_blt(DXGI_DDI_ARG_BLT *pArgs) {
 
 HRESULT APIENTRY virtio_wddm_resolve_shared_resource(DXGI_DDI_ARG_RESOLVESHAREDRESOURCE *pArgs) {
     TRACE();
+
+    VIRTIO_WDDM_Device *device = (void *) pArgs->hDevice;
+
+    /*
+     * ResolveSharedResource marks an ownership transition for a shared
+     * resource. Flush any partially built DXVK/D3D11 command stream so
+     * modifications made by this device are submitted before ownership is
+     * handed off. Synchronization of the submitted GPU work is handled by
+     * the runtime/kernel; a CPU wait here would unnecessarily serialize the
+     * shared-resource path.
+     */
+    ID3D11DeviceContext1_Flush(device->base.pCtx1);
+
     return S_OK;
 }
 
@@ -272,17 +316,15 @@ HRESULT APIENTRY virtio_wddm_blt1(DXGI_DDI_ARG_BLT1 *pArgs) {
 
     ASSERT(pArgs->Rotate == DXGI_DDI_MODE_ROTATION_IDENTITY);
 
-    if (pArgs->Flags.Resolve) {
+    if (pArgs->Flags.Stretch || pArgs->Flags.Convert) {
+        TODO("Stretch/shrink or convert format");
+    } else if (pArgs->Flags.Resolve) {
         ID3D11DeviceContext1_ResolveSubresource(
             device->base.pCtx1,
             dst->base.pResource, pArgs->DstSubresource,
             src->base.pResource, pArgs->SrcSubresource,
             dst->base.Format
         );
-    }
-
-    if (pArgs->Flags.Stretch || pArgs->Flags.Convert) {
-        TODO("Stretch/shrink or convert format");
     } else {
         D3D11_BOX src_box = {
             .left = pArgs->SrcLeft,
@@ -290,7 +332,7 @@ HRESULT APIENTRY virtio_wddm_blt1(DXGI_DDI_ARG_BLT1 *pArgs) {
             .front = 0,
             .right = pArgs->SrcRight,
             .bottom = pArgs->SrcBottom,
-            .front = 1,
+            .back = 1,
         };
 
         ID3D11DeviceContext1_CopySubresourceRegion(
@@ -313,13 +355,61 @@ HRESULT APIENTRY virtio_wddm_blt1(DXGI_DDI_ARG_BLT1 *pArgs) {
 
 HRESULT APIENTRY virtio_wddm_offer_resources(DXGI_DDI_ARG_OFFERRESOURCES *pArgs) {
     TRACE();
+    VIRTIO_WDDM_Device *device = (void *) pArgs->hDevice;
+
+    ID3D11DeviceContext1_Flush(device->base.pCtx1);
+
+    for (size_t i = 0; i < pArgs->Resources; i++) {
+        VIRTIO_WDDM_Resource *resource = (void *) pArgs->pResources[i];
+        if (resource->base.hKMAllocation == 0) {
+            continue;
+        }
+
+        D3DDDICB_OFFERALLOCATIONS offer = {
+            .pResources = NULL,
+            .HandleList = &resource->base.hKMAllocation,
+            .NumAllocations = 1,
+            .Priority = pArgs->Priority,
+        };
+        HRESULT hr = device->base.KTCallbacks.pfnOfferAllocationsCb(device->base.hRTDevice.handle, &offer);
+        if (FAILED(hr)) {
+            ERROR("%s: failed to offer allocation: 0x%08lx", __FUNCTION__, hr);
+            return hr;
+        }
+    }
+
     return S_OK;
 }
 
 HRESULT APIENTRY virtio_wddm_reclaim_resources(DXGI_DDI_ARG_RECLAIMRESOURCES *pArgs) {
     TRACE();
+    VIRTIO_WDDM_Device *device = (void *) pArgs->hDevice;
+
     for (size_t i = 0; i < pArgs->Resources; i++) {
-        pArgs->pDiscarded[i] = false;
+        VIRTIO_WDDM_Resource *resource = (void *) pArgs->pResources[i];
+        if (resource->base.hKMAllocation == 0) {
+            if (pArgs->pDiscarded != NULL) {
+                pArgs->pDiscarded[i] = FALSE;
+            }
+            continue;
+        }
+
+        BOOL discarded = FALSE;
+        D3DDDICB_RECLAIMALLOCATIONS reclaim = {
+            .pResources = NULL,
+            .HandleList = &resource->base.hKMAllocation,
+            .pDiscarded = pArgs->pDiscarded != NULL ? &discarded : NULL,
+            .NumAllocations = 1,
+        };
+        HRESULT hr = device->base.KTCallbacks.pfnReclaimAllocationsCb(device->base.hRTDevice.handle, &reclaim);
+        if (FAILED(hr)) {
+            ERROR("%s: failed to reclaim allocation: 0x%08lx", __FUNCTION__, hr);
+            return hr;
+        }
+
+        if (pArgs->pDiscarded != NULL) {
+            pArgs->pDiscarded[i] = discarded;
+        }
     }
 
     return S_OK;

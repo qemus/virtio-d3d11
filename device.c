@@ -20,11 +20,17 @@ SIZE_T APIENTRY virtio_wddm_calc_device_size(D3D10DDI_HADAPTER hAdapter, const D
 }
 
 static inline void free_d3d11_device(void *ptr) {
-    ID3D11Device_Release(*(ID3D11Device **)ptr);
+    ID3D11Device *device = *(ID3D11Device **)ptr;
+    if (device != NULL) {
+        ID3D11Device_Release(device);
+    }
 }
 
 static inline void free_d3d11_device_context(void *ptr) {
-    ID3D11DeviceContext_Release(*(ID3D11DeviceContext **)ptr);
+    ID3D11DeviceContext *context = *(ID3D11DeviceContext **)ptr;
+    if (context != NULL) {
+        ID3D11DeviceContext_Release(context);
+    }
 }
 
 extern const char *vk_result_to_str(VkResult result) {
@@ -401,7 +407,7 @@ HRESULT APIENTRY virtio_wddm_create_device(D3D10DDI_HADAPTER hAdapter, D3D10DDIA
 
     for (size_t i = 0; i < extension_count; i++) {
         extension_names[i] = extension_props[i].extensionName;
-        if (strcmp(extension_props[i].extensionName, VK_LUNARG_DIRECT_DRIVER_LOADING_EXTENSION_NAME)) {
+        if (strcmp(extension_props[i].extensionName, VK_LUNARG_DIRECT_DRIVER_LOADING_EXTENSION_NAME) == 0) {
             have_LUNARG_direct_driver_loading = true;
         }
     }

@@ -288,9 +288,11 @@ static HRESULT create_shared_vk_image(VIRTIO_WDDM_Device *device, D3D11_TEXTURE2
        .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
     };
     device->vk_GetImageMemoryRequirements2(device->vk, &mem_req_info, &mem_req);
-    ssize_t mem = vulkan_find_mem_type(device, 0, mem_req.memoryRequirements.memoryTypeBits);
     if (mem < 0) {
         ERROR("%s: Failed to find Vulkan memory type", __FUNCTION__);
+        device->vk_DestroyImage(device->vk, *image, NULL);
+        *image = VK_NULL_HANDLE;
+        *memory = VK_NULL_HANDLE;
         return E_OUTOFMEMORY;
     }
 
@@ -365,6 +367,30 @@ static HRESULT create_shared_vk_image(VIRTIO_WDDM_Device *device, D3D11_TEXTURE2
     }
 
     return S_OK;
+}
+
+static void destroy_shared_vk_image(VIRTIO_WDDM_Device *device, VkDeviceMemory *memory, VkImage *image) {
+    if (*image != VK_NULL_HANDLE) {
+        device->vk_DestroyImage(device->vk, *image, NULL);
+        *image = VK_NULL_HANDLE;
+    }
+
+    if (*memory != VK_NULL_HANDLE) {
+        device->vk_FreeMemory(device->vk, *memory, NULL);
+        *memory = VK_NULL_HANDLE;
+    }
+}
+
+static void deallocate_km_resource(VIRTIO_WDDM_Device *device, HANDLE hRTResource) {
+    D3DDDICB_DEALLOCATE deallocate = {
+        .hResource = hRTResource,
+        .NumAllocations = 0,
+        .HandleList = NULL,
+    };
+    HRESULT hr = device->base.KTCallbacks.pfnDeallocateCb(device->base.hRTDevice.handle, &deallocate);
+    if (FAILED(hr)) {
+        ERROR("%s: Failed to deallocate resource: 0x%08lx", __FUNCTION__, hr);
+    }
 }
 
 static inline unsigned dxgi_to_virgl_format(DXGI_FORMAT format) {
@@ -603,6 +629,8 @@ static HRESULT create_shared_3d_resource(VIRTIO_WDDM_Device *device, D3D11_TEXTU
     hr = query_resource_info(device, alloc_info.hAllocation, id, &res_info);
     if (FAILED(hr)) {
         ERROR("%s: Failed to query resource info: 0x%08lx", __FUNCTION__, hr);
+        deallocate_km_resource(device, hRTResource);
+        *hKMResource = 0;
         return hr;
     }
     ASSERT(res_info.tag == VIRTIO_WDDM_ALLOCATE_3D_TAG);
@@ -640,10 +668,14 @@ static HRESULT create_shared_3d_resource(VIRTIO_WDDM_Device *device, D3D11_TEXTU
         hr = device->base.KTCallbacks.pfnWaitForSynchronizationObjectFromCpuCb(device->base.hRTDevice.handle, &wait);
         if (FAILED(hr)) {
             ERROR("%s: Failed to wait for residency: 0x%08lx", __FUNCTION__, hr);
+            deallocate_km_resource(device, hRTResource);
+            *hKMResource = 0;
             return hr;
         }
     } else if (FAILED(hr)) {
         ERROR("%s: Failed to make resident (ms+ctf): 0x%08lx", __FUNCTION__, hr);
+        deallocate_km_resource(device, hRTResource);
+        *hKMResource = 0;
         return hr;
     }
 
@@ -656,8 +688,8 @@ void update_subresource(VIRTIO_WDDM_Device *device, ID3D11Resource *resource, D3
             device->base.pCtx1, resource, i, NULL, subresource_data[i].pSysMem,
             subresource_data[i].SysMemPitch, subresource_data[i].SysMemSlicePitch
         );
-        ID3D11DeviceContext_Flush(device->base.pCtx1);
     }
+    ID3D11DeviceContext_Flush(device->base.pCtx1);
 }
 
 void APIENTRY virtio_wddm_create_resource(D3D10DDI_HDEVICE hDevice, const D3D11DDIARG_CREATERESOURCE *pArgs, D3D10DDI_HRESOURCE hResource, D3D10DDI_HRTRESOURCE hRTResource) {
@@ -734,6 +766,7 @@ void APIENTRY virtio_wddm_create_resource(D3D10DDI_HDEVICE hDevice, const D3D11D
         hr = create_shared_3d_resource(device, &desc, is_primary, hRTResource.handle, &resource->base.hKMResource, &alloc, &id, &alloc_info);
         if (FAILED(hr)) {
             ERROR("%s: failed to create shared 3d texture", __FUNCTION__);
+            free(subresource_data);
             tritonSetError(&device->base, hr);
             return;
         }
@@ -796,6 +829,10 @@ void APIENTRY virtio_wddm_create_resource(D3D10DDI_HDEVICE hDevice, const D3D11D
         hr = create_shared_vk_image(device, &desc, VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT, &modifier_info, &handle_info, &resource->memory, &resource->image, NULL);
         if (FAILED(hr)) {
             ERROR("%s: failed to import shared 3d texture to vulkan", __FUNCTION__);
+            deallocate_km_resource(device, hRTResource.handle);
+            resource->base.hKMResource = 0;
+            resource->base.hKMAllocation = 0;
+            free(subresource_data);
             tritonSetError(&device->base, hr);
             return;
         }
@@ -804,6 +841,11 @@ void APIENTRY virtio_wddm_create_resource(D3D10DDI_HDEVICE hDevice, const D3D11D
         hr = DXVK_IDXGIVkInteropDevice1_CreateTexture2DFromVkImage(device->base.pDev1, &desc, resource->image, &tex);
         if (FAILED(hr)) {
             ERROR("%s: failed to import VkImage to DXVK: 0x%08lx", __FUNCTION__, hr);
+            destroy_shared_vk_image(device, &resource->memory, &resource->image);
+            deallocate_km_resource(device, hRTResource.handle);
+            resource->base.hKMResource = 0;
+            resource->base.hKMAllocation = 0;
+            free(subresource_data);
             tritonSetError(&device->base, hr);
             return;
         }
@@ -840,11 +882,21 @@ void APIENTRY virtio_wddm_create_resource(D3D10DDI_HDEVICE hDevice, const D3D11D
             .pCreateResource11 = pArgs,
         };
         hr = create_shared_vk_image(device, &desc, VK_IMAGE_TILING_OPTIMAL, NULL, &d3d_create, &resource->memory, &resource->image, &resource->base.hKMAllocation);
+        if (FAILED(hr)) {
+            ERROR("%s: failed to create shared VkImage: 0x%08lx", __FUNCTION__, hr);
+            free(subresource_data);
+            tritonSetError(&device->base, hr);
+            return;
+        }
 
         ID3D11Texture2D *tex = NULL;
         hr = DXVK_IDXGIVkInteropDevice1_CreateTexture2DFromVkImage(device->base.pDev1, &desc, resource->image, &tex);
         if (FAILED(hr)) {
             ERROR("%s: failed to import VkImage to DXVK: 0x%08lx", __FUNCTION__, hr);
+            destroy_shared_vk_image(device, &resource->memory, &resource->image);
+            deallocate_km_resource(device, hRTResource.handle);
+            resource->base.hKMAllocation = 0;
+            free(subresource_data);
             tritonSetError(&device->base, hr);
             return;
         }
@@ -994,6 +1046,7 @@ void APIENTRY virtio_wddm_open_resource(D3D10DDI_HDEVICE hDevice, const D3D10DDI
     HRESULT hr = query_resource_info(device, pArgs->pOpenAllocationInfo2->hAllocation, &id, &alloc_info);
     if (FAILED(hr)) {
         ERROR("%s: failed to query resource info: hr=0x%08lx", __FUNCTION__, hr);
+        deallocate_km_resource(device, hRTResource.handle);
         tritonSetError(&device->base, hr);
         return;
     }
@@ -1076,6 +1129,7 @@ void APIENTRY virtio_wddm_open_resource(D3D10DDI_HDEVICE hDevice, const D3D10DDI
         hr = create_shared_vk_image(device, &desc, VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT, &modifier_info, &handle_info, &resource->memory, &resource->image, NULL);
         if (FAILED(hr)) {
             ERROR("%s: failed to import shared 3d texture to vulkan", __FUNCTION__);
+            deallocate_km_resource(device, hRTResource.handle);
             tritonSetError(&device->base, hr);
             return;
         }
@@ -1084,6 +1138,8 @@ void APIENTRY virtio_wddm_open_resource(D3D10DDI_HDEVICE hDevice, const D3D10DDI
         hr = DXVK_IDXGIVkInteropDevice1_CreateTexture2DFromVkImage(device->base.pDev1, &desc, resource->image, &tex);
         if (FAILED(hr)) {
             ERROR("%s: failed to import VkImage to DXVK: 0x%08lx", __FUNCTION__, hr);
+            destroy_shared_vk_image(device, &resource->memory, &resource->image);
+            deallocate_km_resource(device, hRTResource.handle);
             tritonSetError(&device->base, hr);
             return;
         }
@@ -1158,6 +1214,7 @@ void APIENTRY virtio_wddm_open_resource(D3D10DDI_HDEVICE hDevice, const D3D10DDI
         }
         if (FAILED(hr)) {
             ERROR("%s: failed to import shared blob to vulkan", __FUNCTION__);
+            deallocate_km_resource(device, hRTResource.handle);
             tritonSetError(&device->base, hr);
             return;
         }
@@ -1166,6 +1223,8 @@ void APIENTRY virtio_wddm_open_resource(D3D10DDI_HDEVICE hDevice, const D3D10DDI
         hr = DXVK_IDXGIVkInteropDevice1_CreateTexture2DFromVkImage(device->base.pDev1, &desc, resource->image, &tex);
         if (FAILED(hr)) {
             ERROR("%s: failed to import VkImage to DXVK: 0x%08lx", __FUNCTION__, hr);
+            destroy_shared_vk_image(device, &resource->memory, &resource->image);
+            deallocate_km_resource(device, hRTResource.handle);
             tritonSetError(&device->base, hr);
             return;
         }
@@ -1174,6 +1233,7 @@ void APIENTRY virtio_wddm_open_resource(D3D10DDI_HDEVICE hDevice, const D3D10DDI
         resource->base.pResource = (ID3D11Resource *)tex;
     } else {
         ERROR("%s: Invalid allocation type: 0x%016x", __FUNCTION__, alloc_info.tag);
+        deallocate_km_resource(device, hRTResource.handle);
         tritonSetError(&device->base, E_INVALIDARG);
     }
 }
